@@ -911,56 +911,82 @@
 
         primitive?             (some primitive? tags)
 
-        method-name            (cond
-                                 variadic? :doInvoke
-                                 primitive? :invokePrim
-                                 :else :invoke)
+        code-method-name            (cond
+                                      variadic? :doInvoke
+                                      primitive? :invokePrim
+                                      static? :invokeStatic
+                                      :else :invoke)
 
         ;; arg-types
         [loop-label end-label] (repeatedly label)
 
-        code
-        `[[:start-method]
-          [:local-variable :this :clojure.lang.AFunction nil ~loop-label ~end-label :this]
-          ~@(mapcat (fn [{:keys [name arg-id o-tag tag]}]
-                      `[~[:local-variable name tag nil loop-label end-label name]
-                        ~@(when-not (= tag o-tag)
-                            [[:load-arg arg-id]
-                             [:check-cast tag]
-                             [:store-arg arg-id]])])
+        code `[[:start-method]
+               [:local-variable :this :clojure.lang.AFunction nil ~loop-label ~end-label :this]
+               ~@(mapcat (fn [{:keys [name arg-id o-tag tag]}]
+                           `[~[:local-variable name tag nil loop-label end-label name]
+                             ~@(when-not (= tag o-tag)
+                                [[:load-arg arg-id]
+                                 [:check-cast tag]
+                                 [:store-arg arg-id]])])
                   params)
-          [:mark ~loop-label]
-          ~@(emit-line-number env loop-label)
-          ~@(emit body (assoc frame
-                         :loop-label  loop-label
-                         :loop-locals params
-                         :params      params))
-          [:mark ~end-label]
-          [:return-value]
-          [:end-method]]]
+               [:mark ~loop-label]
+               ~@(emit-line-number env loop-label)
+               ~@(emit body (assoc frame
+                                   :loop-label  loop-label
+                                   :loop-locals params
+                                   :params      params))
+               [:mark ~end-label]
+               [:return-value]
+               [:end-method]]
+        delegate-invoke-to-primitive (when primitive?
+                                       `[[:start-method]
+                                         [:load-this]
+                                         ~@(mapcat (fn [{:keys [tag]} id]
+                                                     `[~[:load-arg id]
+                                                       ~@(emit-cast Object tag)])
+                                            params (range))
+                                         ~[:invoke-virtual (into [(keyword class "invokePrim")] arg-tags) return-type]
+                                         ~@(emit-cast return-type Object)
+                                         [:return-value]
+                                         [:end-method]])
+        delegate-prim-to-static (when static?
+                                  `[[:start-method]
+                                    ~@(map-indexed (fn [idx arg] [:load-arg idx]) params)
+                                    ~[:invoke-static (into [(keyword class "invokeStatic")] arg-tags) return-type]
+                                    [:return-value]
+                                    [:end-method]])
+        delegate-invoke-to-static (when static?
+                                    `[[:start-method]
+                                      ~@(mapcat (fn [{:keys [tag]} id]
+                                                  `[~[:load-arg id]
+                                                    ~@(emit-cast Object tag)])
+                                         params (range))
+                                      ~[:invoke-static (into [(keyword class "invokeStatic")] arg-tags) return-type]
+                                      ~@(emit-cast return-type Object)
+                                      [:return-value]
+                                      [:end-method]])]
 
     ;; should emit typed only when there's an interface, otherwise it's useless
 
     `[~{:op     :method
         :attr   #{:public}
-        :method [(into [method-name] arg-tags) return-type]
-        :code   code}
+        :method [(into [:invoke] (repeat (count params) :java.lang.Object))
+                 :java.lang.Object]
+        :code   (cond
+                  static? delegate-invoke-to-static
+                  primitive? delegate-invoke-to-primitive
+                  :else code)}
+      ~@(when static?
+         [{:op :method
+           :attr #{:static :public}
+           :method [(into [:invokeStatic] arg-tags) return-type]
+           :code code}])
       ~@(when primitive?
-          [{:op        :method
-            :attr      #{:public}
-            :interface prim-interface
-            :method    [(into [:invoke] (repeat (count params) :java.lang.Object))
-                        :java.lang.Object]
-            :code      `[[:start-method]
-                         [:load-this]
-                         ~@(mapcat (fn [{:keys [tag]} id]
-                                     `[~[:load-arg id]
-                                       ~@(emit-cast Object tag)])
-                                   params (range))
-                         ~[:invoke-virtual (into [(keyword class "invokePrim")] arg-tags) return-type]
-                         ~@(emit-cast return-type Object)
-                         [:return-value]
-                         [:end-method]]}])
+         [{:op        :method
+           :attr      #{:public}
+           :interface prim-interface
+           :method    [(into [:invokePrim] arg-tags) return-type]
+           :code      (if static? delegate-prim-to-static code)}])
       ~@(when internal-methods
           (emit-internal-methods internal-methods (assoc frame :params params)))]))
 
