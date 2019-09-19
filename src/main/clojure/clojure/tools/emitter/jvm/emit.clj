@@ -209,7 +209,7 @@
   (let [var-sym (var-sym var)]
     [[:push (name (namespace var-sym))]
      [:push (name var-sym)]
-     [:invoke-static [:clojure.lang.RT/var String String] Var]]))
+     [:invoke-static [:clojure.lang.RT/var String String] clojure.lang.Var]]))
 
 (defmethod -emit :var
   [{:keys [var] :as ast} frame]
