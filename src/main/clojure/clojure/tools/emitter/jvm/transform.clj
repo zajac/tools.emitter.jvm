@@ -12,8 +12,9 @@
             [clojure.tools.analyzer.jvm.utils :refer [maybe-class]]
             [clojure.tools.analyzer.utils :refer [boolean?]]
             [clojure.core.memoize :refer [lru]]
-            [clojure.reflect :as r])
-  (:import (org.objectweb.asm Type Label Opcodes ClassWriter ClassReader)
+            [clojure.reflect :as r]
+            [clojure.tools.analyzer.env :as env])
+  (:import (org.objectweb.asm Type Label Opcodes ClassWriter ClassReader Handle)
            (org.objectweb.asm.commons GeneratorAdapter Method)
            (org.objectweb.asm.util CheckClassAdapter TraceClassVisitor)))
 
@@ -66,10 +67,14 @@
    :else
    (name x)))
 
+
+
 (defn method-desc [ret method args]
   (Method/getMethod (str (type-str ret) " "
                          (name method)
                          \( (s/join ", " (map type-str args)) \))))
+
+(Type/getMethodDescriptor ^Type Type/INT_TYPE (into-array Type [Type/LONG_TYPE Type/LONG_TYPE]))
 
 (def ^:dynamic *labels*)
 (def ^:dynamic *locals*)
@@ -106,6 +111,7 @@
           (-exec inst args gen))
         (recur cur (first bc) (next bc))))))
 
+
 (def ^Class get-class
   (lru
    (fn [type-desc]
@@ -136,6 +142,29 @@
   (let [[class method-name]
         [(namespace method) (name method)]]
     (.invokeStatic gen (type class) (method-desc ret method-name args))))
+
+(defn get-method-type [args ret]
+  (Type/getMethodDescriptor (type (get-class ret)) (into-array Type (map (comp type get-class) args))))
+
+[:invoke-dynamic [:MyClass/myBSMethod String] [["foo" Integer] boolean] ["bs-argument"]]
+
+(defmethod -exec :invoke-dynamic
+  [_ [[bootstrap-method & bs-arg-types] [[method & arg-types] ret] bs-args] ^GeneratorAdapter gen]
+  (let [[bs-class bs-method-name] [(namespace bootstrap-method) (name bootstrap-method)]
+        bootstrap-handle (Handle. Opcodes/H_INVOKESTATIC
+                                  (s/replace bs-class \. \/)
+                                  bs-method-name
+                                  (get-method-type (into
+                                                    [java.lang.invoke.MethodHandles$Lookup
+                                                     String
+                                                     java.lang.invoke.MethodType]
+                                                    bs-arg-types)
+                                                   java.lang.invoke.CallSite))]
+    (.invokeDynamic gen
+                    (name method)
+                    (get-method-type arg-types ret)
+                    bootstrap-handle
+                    (object-array bs-args))))
 
 (defmethod -exec :invoke-virtual
   [_ [[method & args] ret] ^GeneratorAdapter gen]
@@ -467,7 +496,7 @@
         cname #(s/replace (type-str %) \. \/)
         name (cname name)]
 
-    (.visit cv Opcodes/V1_6 (compute-attr attr) name nil (cname super)
+    (.visit cv Opcodes/V1_8 (compute-attr attr) name nil (cname super)
             (into-array String (mapv cname interfaces)))
 
     (.visitSource cv name nil)
@@ -487,3 +516,125 @@
               v (CheckClassAdapter. v)]
           (.accept cr v 0)))
       bc)))
+
+
+(comment
+
+  (require '[clojure.tools.analyzer.jvm :as a.jvm])
+  (require '[clojure.tools.emitter.jvm :as e.jvm])
+  (require '[clojure.tools.emitter.jvm.emit :as e.jvm.emit])
+  (require '[clojure.pprint :refer [pprint]])
+
+  (def file
+    '((ns emit-test)
+
+      (def x 12)
+
+      (prn x)
+
+      (defn foo []
+        (def bar 17))
+
+      (let [h 17]
+        (def hh (fn [] h)))
+
+      (defn bar [])))
+
+  (def ^:dynamic *vars*)
+  (defn collect-vars-pass-state []
+    *vars*)
+
+  (require 'clojure.tools.analyzer.passes.collect-closed-overs)
+
+  (defn var-sym [var]
+    (let [{:keys [name ns]} (meta var)]
+      (symbol (clojure.core/name (ns-name ns)) (clojure.core/name name))))
+
+  {:var/kind #{:var.kind/constant :var.kind/static-fn :var.kind/changed :var.kind/declared}
+   :var.static-fn/class-name "fn$1212"
+   :var.static-fn/method-name "invokeStatic"
+   :var.constant/field-name "var_x_value"}
+
+
+(defn my-pass
+  {:pass-info {:walk :pre
+               :depends #{#'clojure.tools.analyzer.passes.collect-closed-overs/collect-closed-overs}
+               :state collect-vars-pass-state}}
+  [state ast]
+  (when (= (:op ast) :def)
+    (swap! state (fn [state]
+                   (let [{:keys [var init]} ast
+                         var-sym (var-sym var)
+                         declared? (:declared (meta var))
+                         static-fn? (and (= (:op init) :with-meta)
+                                         (= (:op (:expr init)) :fn)
+                                         (empty? (:closed-overs (:expr init))))
+                         var-info (get state var-sym)]
+                     (when (= var-sym `hh)
+                       (def shit ast))
+                     (assoc state var-sym
+                            (if (and declared? (nil? var-info))
+                              {:var/kind :var.kind/declared}
+                              (if (or (= (:var/kind var-info) :var.kind/declared)
+                                      (nil? var-info))
+                                (if static-fn?
+                                  {:var/kind :var.kind/static-fn
+                                   :var.static-fn/class-name (str (namespace var-sym) "$" (gensym (name var-sym)))
+                                   :var.static-fn/method-name "invokeStatic"}
+                                  {:var/kind :var.kind/constant
+                                   :var.constant/field-name (str "var_" (name var-sym) "_value")})
+                                {:var/kind :var.kind/changed})))))))
+  ast)
+
+  (defn compile
+    ([file] (compile file (clojure.lang.RT/makeClassLoader)))
+    ([file cl]
+    (binding [a.jvm/run-passes (clojure.tools.analyzer.passes/schedule (-> e.jvm/passes
+                                                                           (conj #'my-pass)
+                                                                           #_(disj #'clojure.tools.emitter.passes.jvm.collect/collect)))
+              *vars* (atom {})]
+      (let [analyze-opts {:bindings {Compiler/LOADER cl}}
+            analyzed-forms (doall (map (fn [form]
+                                         (with-bindings (:bindings analyze-opts)
+                                           (a.jvm/analyze+eval form (a.jvm/empty-env) analyze-opts))) file))
+            init-fn `(^:once fn* [] ~@(map :expanded-form analyzed-forms))
+
+            classes (e.jvm.emit/emit-classes (a.jvm/analyze init-fn (a.jvm/empty-env) analyze-opts))
+            r {:forms analyzed-forms
+               :vars @*vars*
+               :init-fn init-fn
+               :bytecode classes}]
+        (binding [*compile-files* true]
+          (doseq [class classes]
+            (e.jvm/compile-and-load class)))
+        r))))
+
+  (def r (compile
+          '((defn y ^long [^long x] (inc x)))))
+
+  (def cl (doto (clojure.lang.RT/makeClassLoader)
+                (.addURL (.toURL (java.io.File. (System/getProperty "user.dir"))))))
+
+  (def loader-test
+    (compile (list clojure.tools.emitter.temp/bootstrap-invoke) cl))
+
+  (defn print-ast [compile-res]
+    (clojure.pprint/pprint
+     (clojure.walk/postwalk
+      (fn [form]
+        (if (map? form)
+          (dissoc form :env)
+          form))
+      (:forms compile-res))))
+
+  (def r (compile
+          '((defn y ^long [^long x] (inc x)))))
+
+  (print-ast r)
+
+  )
+
+
+
+
+

@@ -188,18 +188,36 @@
   [{:keys [expr]} frame]
   (-emit expr frame))
 
+(def ^:dynamic *vars-info*)
+
+(defn var-sym [var]
+  (let [{:keys [name ns]} (meta var)]
+    (symbol (clojure.core/name (ns-name ns)) (clojure.core/name name))))
+
+(defn loader-class [namespace-sym]
+  (str namespace-sym "__init"))
+
+(defn var-loader-class [var]
+  (loader-class (namespace (var-sym var))))
+
 (defn emit-var
-  [{:keys [id]} frame]
-  ^:const
-  [[:get-static (frame :class) (str "const__" id) clojure.lang.Var]])
+  [{:keys [var id]} frame]
+  ;; TODO: good place for laziness?
+  ;; opt1: RT.var
+  ;; opt2: NSLoader.var_x
+  ;; opt3: invoke-dynamic: NSLoader.getVar("x")
+  (let [var-sym (var-sym var)]
+    [[:push (name (namespace var-sym))]
+     [:push (name var-sym)]
+     [:invoke-static [:clojure.lang.RT/var String String] Var]]))
 
 (defmethod -emit :var
   [{:keys [var] :as ast} frame]
-  (conj
-   (emit-var ast frame)
-   [:invoke-virtual [(if (u/dynamic? var)
-                       :clojure.lang.Var/get
-                       :clojure.lang.Var/getRawRoot)] :java.lang.Object]))
+  (let [var-sym (var-sym var)]
+    [[:invoke-dynamic
+      [(keyword (loader-class (namespace var-sym)) "bootstrapDeref") String]
+      [["deref"] Object]
+      [(name var-sym)]]]))
 
 (defmethod -emit-set! :var
   [{:keys [target val] :as ast} frame]
@@ -213,21 +231,34 @@
 
 (defmethod -emit :def
   [{:keys [var meta init env] :as ast} frame]
-  `[~@(emit-var ast frame)
-    ~@(when (u/dynamic? var)
-        [[:push true]
-         [:invoke-virtual [:clojure.lang.Var/setDynamic :boolean] :clojure.lang.Var]])
-    ~@(when meta
-        `[[:dup]
-          ~@(emit meta frame)
-          [:invoke-virtual [:clojure.lang.Var/setMeta :clojure.lang.IPersistentMap] :void]])
-    ~@(when init
-        `[[:dup]
-          ~@(emit init frame)
-          [:invoke-virtual [:clojure.lang.Var/bindRoot :java.lang.Object] :void]])
-    ~@(when (u/macro? var)
-        [[:dup]
-         [:invoke-virtual [:clojure.lang.Var/setMacro] :void]])])
+  (let [var-info (get *vars-info* (var-sym var))
+        var-kind (:var/kind var-info)]
+    (cond
+      (= :var.kind/static-fn var-kind)
+      []
+
+      (= :var.kind/constant var-kind)
+      (let [var-sym (var-sym var)
+            loader-class (loader-class (namespace var-sym))]
+        (conj (emit init frame)
+              [:put-static (var-loader-class var) (:vat.constant/field-name var-info) Object]))
+
+      :else
+      `[~@(emit-var ast frame)
+        ~@(when (u/dynamic? var)
+           [[:push true]
+            [:invoke-virtual [:clojure.lang.Var/setDynamic :boolean] :clojure.lang.Var]])
+        ~@(when meta
+           `[[:dup]
+             ~@(emit meta frame)
+             [:invoke-virtual [:clojure.lang.Var/setMeta :clojure.lang.IPersistentMap] :void]])
+        ~@(when init
+           `[[:dup]
+             ~@(emit init frame)
+             [:invoke-virtual [:clojure.lang.Var/bindRoot :java.lang.Object] :void]])
+        ~@(when (u/macro? var)
+           [[:dup]
+            [:invoke-virtual [:clojure.lang.Var/setMacro] :void]])])))
 
 (defmethod -emit :set!
   [ast frame]
@@ -537,23 +568,35 @@
      ~@(emit else frame)
      [:mark ~end-label]]))
 
+(defn emit-args [args {:keys [to-clear?] :as frame}]
+  (let [frame (dissoc frame :to-clear?)]
+    `[~@(mapcat #(emit % frame) (take 19 args))
+      ~@(when-let [args (seq (drop 19 args))]
+         (emit-as-array args frame))
+      ~@(when to-clear?
+         [[:insn :ACONST_NULL]
+          [:var-insn :clojure.lang.Object/ISTORE 0]])]))
+
 (defn emit-args-and-invoke
   ([args frame] (emit-args-and-invoke args frame false))
   ([args {:keys [to-clear?] :as frame} proto?]
-     (let [frame (dissoc frame :to-clear?)]
-       `[~@(mapcat #(emit % frame) (take 19 args))
-         ~@(when-let [args (seq (drop 19 args))]
-             (emit-as-array args frame))
-         ~@(when to-clear?
-             [[:insn :ACONST_NULL]
-              [:var-insn :clojure.lang.Object/ISTORE 0]])
-         [:invoke-interface [:clojure.lang.IFn/invoke ~@(repeat (min 20 (count args)) :java.lang.Object) ~@(when proto? [:java.lang.Object])] :java.lang.Object]])))
+   `[~@(emit-args args frame)
+     [:invoke-interface [:clojure.lang.IFn/invoke ~@(repeat (min 20 (count args)) :java.lang.Object) ~@(when proto? [:java.lang.Object])] :java.lang.Object]]))
 
 (defmethod -emit :invoke
   [{:keys [fn args env to-clear?]} frame]
-  `[~@(emit fn frame)
-    [:check-cast :clojure.lang.IFn]
-    ~@(emit-args-and-invoke args (assoc frame :to-clear? to-clear?))])
+  (if (and (= (:op fn) :var)
+           (contains? *vars-info* (var-sym (:var fn))))
+    (let [var-sym (var-sym (:var fn))]
+      (assert (< (count args) 19) "TODO fix invoke-dynamic type signature")
+      `[~@(emit-args args frame)
+        [:invoke-dynamic
+         [~(keyword (loader-class (namespace var-sym)) "bootstrapInvoke") java.lang.String]
+         [~(into ["invoke"] (repeat (count args) java.lang.Object)) java.lang.Object]
+         [~(name var-sym)]]])
+    `[~@(emit fn frame)
+      [:check-cast :clojure.lang.IFn]
+      ~@(emit-args-and-invoke args (assoc frame :to-clear? to-clear?))]))
 
 (defmethod -emit :protocol-invoke
   [{:keys [protocol-fn target args env to-clear?]} frame]
@@ -859,7 +902,7 @@
         methods))
 
 (defmethod -emit :fn-method
-  [{:keys [params tag fixed-arity variadic? body env internal-methods]}
+  [{:keys [params tag fixed-arity static? variadic? body env internal-methods]}
    {:keys [class] :as frame}]
   (let [arg-tags               (mapv (comp prim-or-obj :tag) params)
         return-type            (prim-or-obj tag)
@@ -869,10 +912,9 @@
         primitive?             (some primitive? tags)
 
         method-name            (cond
-                                variadic? :doInvoke
-                                primitive? :invokePrim
-                                :else
-                                :invoke)
+                                 variadic? :doInvoke
+                                 primitive? :invokePrim
+                                 :else :invoke)
 
         ;; arg-types
         [loop-label end-label] (repeatedly label)

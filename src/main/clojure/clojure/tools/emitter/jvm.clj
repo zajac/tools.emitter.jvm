@@ -195,3 +195,12 @@
                                     :compile-files compile-files})))
                (recur))))
          nil))))
+
+(comment
+
+  (load "/emit-test")
+  emit-test/x
+
+  (a/analyze `(^:once fn* [] ~mform) (a/empty-env) analyze-opts)
+  *e
+  )
