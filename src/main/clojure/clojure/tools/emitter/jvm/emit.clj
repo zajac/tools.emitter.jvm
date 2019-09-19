@@ -238,10 +238,9 @@
       []
 
       (= :var.kind/constant var-kind)
-      (let [var-sym (var-sym var)
-            loader-class (loader-class (namespace var-sym))]
+      (let [loader-class (loader-class (namespace (var-sym var)))]
         (conj (emit init frame)
-              [:put-static (var-loader-class var) (:vat.constant/field-name var-info) Object]))
+              [:put-static loader-class (:vat.constant/field-name var-info) Object]))
 
       :else
       `[~@(emit-var ast frame)
