@@ -46,18 +46,18 @@
       (assoc ast :id id))
     ast))
 
-(defmethod -collect-const :def
+#_(defmethod -collect-const :def
   [ast]
   (let [var (:var ast)
         id (-register-constant var clojure.lang.Var :var (meta var))]
     (assoc ast :id id)))
 
-(defmethod -collect-const :var
+#_(defmethod -collect-const :var
   [ast]
   (let [id (-register-constant (:var ast) clojure.lang.Var :var (:meta ast))]
     (assoc ast :id id)))
 
-(defmethod -collect-const :the-var
+#_(defmethod -collect-const :the-var
   [ast]
   (let [var (:var ast)
         id (-register-constant var clojure.lang.Var :var (meta var))]
