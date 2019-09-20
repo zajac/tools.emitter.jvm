@@ -195,7 +195,10 @@
     (symbol (clojure.core/name (ns-name ns)) (clojure.core/name name))))
 
 (defn loader-class [namespace-sym]
-  (str namespace-sym "__init"))
+  (str (namespace-munge namespace-sym) "__init"))
+
+(defn bootstrap-invoke-class [namespace-sym]
+  (str (namespace-munge namespace-sym) "__bootstrap__invoke"))
 
 (defn var-loader-class [var]
   (loader-class (namespace (var-sym var))))
@@ -229,13 +232,27 @@
   [ast frame]
   (emit-var ast frame))
 
+(declare emit-class)
+
+(defn emit-fn-class [{:keys [variadic?] :as fn-ast} frame class-name]
+  (let [super (if variadic? :clojure.lang.RestFn :clojure.lang.AFunction)
+        ast (assoc fn-ast
+                   :class-name class-name
+                   :super super)]
+    (emit-class ast frame)))
+
 (defmethod -emit :def
   [{:keys [var meta init env] :as ast} frame]
   (let [var-info (get *vars-info* (var-sym var))
         var-kind (:var/kind var-info)]
     (cond
       (= :var.kind/static-fn var-kind)
-      []
+      (let [expr (case (:op init)
+                   :with-meta (:expr init)
+                   :fn init
+                   (throw (ex-info "can't handle init" init)))]
+        (emit-fn-class expr frame (:var.static-fn/class-name var-info))
+        [[:insn :ACONST_NULL]])
 
       (= :var.kind/constant var-kind)
       (let [loader-class (loader-class (namespace (var-sym var)))]
@@ -578,19 +595,18 @@
 
 (defn emit-args-and-invoke
   ([args frame] (emit-args-and-invoke args frame false))
-  ([args {:keys [to-clear?] :as frame} proto?]
+  ([args frame proto?]
    `[~@(emit-args args frame)
      [:invoke-interface [:clojure.lang.IFn/invoke ~@(repeat (min 20 (count args)) :java.lang.Object) ~@(when proto? [:java.lang.Object])] :java.lang.Object]]))
 
 (defmethod -emit :invoke
   [{:keys [fn args env to-clear?]} frame]
-  (if (and (= (:op fn) :var)
-           (contains? *vars-info* (var-sym (:var fn))))
+  (if (= (:op fn) :var)
     (let [var-sym (var-sym (:var fn))]
       (assert (< (count args) 19) "TODO fix invoke-dynamic type signature")
       `[~@(emit-args args frame)
         [:invoke-dynamic
-         [~(keyword (loader-class (namespace var-sym)) "bootstrapInvoke") java.lang.String]
+         [~(keyword (bootstrap-invoke-class (namespace var-sym)) "bootstrapInvoke") java.lang.String]
          [~(into ["invoke"] (repeat (count args) java.lang.Object)) java.lang.Object]
          [~(name var-sym)]]])
     `[~@(emit fn frame)
@@ -640,14 +656,22 @@
 
 (defmethod -emit :prim-invoke
   [{:keys [fn args ^Class prim-interface o-tag to-clear?]} frame]
-  `[~@(emit fn frame)
-    [:check-cast ~prim-interface]
-    ~@(mapcat #(emit % frame) args)
-    ~@(when to-clear?
-        [[:insn :ACONST_NULL]
-         [:var-insn :clojure.lang.Object/ISTORE 0]])
-    [:invoke-interface [~(keyword (.getName prim-interface) "invokePrim")
-                        ~@(mapv :tag args)] ~o-tag]])
+  (if (and (= (:op fn) :var)
+           (= (:var/kind (get *vars-info* (var-sym (:var fn)))) :var.kind/static-fn))
+    (let [var-sym (var-sym (:var fn))]
+      `[~@(mapcat #(emit % frame) args)
+        [:invoke-dynamic
+         [~(keyword (bootstrap-invoke-class (namespace var-sym)) "bootstrapInvoke") java.lang.String]
+         [~(into ["invoke"] (map :tag) args) ~o-tag]
+         [~(name var-sym)]]])
+    `[~@(emit fn frame)
+      [:check-cast ~prim-interface]
+      ~@(mapcat #(emit % frame) args)
+      ~@(when to-clear?
+         [[:insn :ACONST_NULL]
+          [:var-insn :clojure.lang.Object/ISTORE 0]])
+      [:invoke-interface [~(keyword (.getName prim-interface) "invokePrim")
+                          ~@(mapv :tag args)] ~o-tag]]))
 
 (defn emit-shift-mask
   [{:keys [shift mask]}]
@@ -1546,13 +1570,9 @@
       {:untyped true})))
 
 (defmethod -emit :fn
-  [{:keys [form internal-name variadic?] :as ast}
-   frame]
-  (let [class-name (str (namespace-munge *ns*)
-                        "$"
-                        (munge internal-name))
-        super (if variadic? :clojure.lang.RestFn :clojure.lang.AFunction)
-        ast (assoc ast
-              :class-name class-name
-              :super super)]
-    (emit-class ast frame)))
+  [{:keys [form internal-name variadic? class-name] :as ast} frame]
+  (let [class-name (or class-name
+                     (str (namespace-munge *ns*)
+                          "$"
+                          (munge internal-name)))]
+    (emit-fn-class ast frame class-name)))
